@@ -121,6 +121,7 @@ include("indices.jl")
 include("array.jl")
 include("abstractarray.jl")
 include("subarray.jl")
+include("reinterpretarray.jl")
 
 # Array convenience converting constructors
 Array{T}(m::Integer) where {T} = Array{T,1}(Int(m))
