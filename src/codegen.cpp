@@ -2134,16 +2134,16 @@ static Value *emit_bits_compare(jl_codectx_t &ctx, const jl_cgval_t &arg1, const
         if (sz > 512 && !((jl_datatype_t*)arg1.typ)->layout->haspadding) {
             Value *answer = ctx.builder.CreateCall(prepare_call(memcmp_derived_func),
                             {
-                            data_pointer(ctx, arg1, T_pint8),
-                            data_pointer(ctx, arg2, T_pint8),
+                            maybe_bitcast(ctx, data_pointer(ctx, arg1), T_pint8),
+                            maybe_bitcast(ctx, data_pointer(ctx, arg2), T_pint8),
                             ConstantInt::get(T_size, sz)
                             });
             return ctx.builder.CreateICmpEQ(answer, ConstantInt::get(T_int32, 0));
         }
         else {
             Type *atp = at->getPointerTo();
-            Value *varg1 = data_pointer(ctx, arg1, atp);
-            Value *varg2 = data_pointer(ctx, arg2, atp);
+            Value *varg1 = maybe_bitcast(ctx, data_pointer(ctx, arg1), atp);
+            Value *varg2 = maybe_bitcast(ctx, data_pointer(ctx, arg2), atp);
             jl_svec_t *types = ((jl_datatype_t*)arg1.typ)->types;
             Value *answer = ConstantInt::get(T_int1, 1);
             for (size_t i = 0, l = jl_svec_len(types); i < l; i++) {
@@ -2835,7 +2835,7 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
         }
         else {
             size_t offs = jl_field_offset(stt, fieldidx);
-            Value *ptr = data_pointer(ctx, obj, T_pint8);
+            Value *ptr = emit_bitcast(ctx, data_pointer(ctx, obj), T_pint8);
             Value *llvm_idx = ConstantInt::get(T_size, offs);
             Value *addr = ctx.builder.CreateGEP(ptr, llvm_idx);
             // emit this using the same type as emit_getfield_knownidx
@@ -2925,7 +2925,8 @@ static jl_cgval_t emit_call_function_object(jl_method_instance_t *li, jl_llvm_fu
                 // can lazy load on demand, no copy needed
                 assert(at == PointerType::get(et, AddressSpace::Derived));
                 assert(arg.ispointer());
-                argvals[idx] = decay_derived(data_pointer(ctx, arg, at));
+                argvals[idx] = decay_derived(maybe_bitcast(ctx,
+                    data_pointer(ctx, arg), at));
             }
             else {
                 assert(at == et);
@@ -3434,7 +3435,7 @@ static void emit_vi_assignment_unboxed(jl_codectx_t &ctx, jl_varinfo_t &vi, Valu
                 assert(jl_is_leaf_type(vi.value.typ));
                 Value *copy_bytes = ConstantInt::get(T_int32, jl_datatype_size(vi.value.typ));
                 ctx.builder.CreateMemCpy(vi.value.V,
-                                     data_pointer(ctx, rval_info, T_pint8),
+                                     data_pointer(ctx, rval_info),
                                      copy_bytes,
                                      jl_datatype_align(rval_info.typ),
                                      vi.isVolatile,
@@ -4300,7 +4301,8 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
             }
             else if (T->isAggregateType()) {
                 // aggregate types are passed by pointer
-                arg = data_pointer(ctx, inputarg, T->getPointerTo());
+                arg = maybe_bitcast(ctx, data_pointer(ctx, inputarg),
+                    T->getPointerTo());
             }
             else {
                 arg = emit_unbox(ctx, T, inputarg, spect);
@@ -5699,7 +5701,7 @@ static std::unique_ptr<Module> emit_function(
                         assert(jl_is_leaf_type(jlrettype));
                         Value *copy_bytes = ConstantInt::get(T_int32, jl_datatype_size(jlrettype));
                         ctx.builder.CreateMemCpy(sret,
-                                             data_pointer(ctx, retvalinfo, T_pint8),
+                                             data_pointer(ctx, retvalinfo),
                                              copy_bytes,
                                              returninfo.union_minalign);
                     }
@@ -6574,7 +6576,7 @@ static void init_julia_llvm_env(Module *m)
                                         "llvm.julia.gc_preserve_end");
     add_named_global(gc_preserve_end_func, (void*)NULL, /*dllimport*/false);
 
-    pointer_from_objref_func = Function::Create(FunctionType::get(T_size,
+    pointer_from_objref_func = Function::Create(FunctionType::get(T_pjlvalue,
                                          ArrayRef<Type*>(PointerType::get(T_jlvalue, AddressSpace::Derived)), false),
                                          Function::ExternalLinkage,
                                          "julia.pointer_from_objref");

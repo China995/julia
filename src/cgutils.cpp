@@ -235,7 +235,7 @@ static Value *emit_pointer_from_objref(jl_codectx_t &ctx, Value *V)
 #else
     Call->addAttribute(AttributeSet::FunctionIndex, Attribute::ReadNone);
 #endif
-    return Call;
+    return ctx.builder.CreatePtrToInt(Call, T_size);
 }
 
 // --- emitting pointers directly into code ---
@@ -366,6 +366,12 @@ static Value *emit_bitcast(jl_codectx_t &ctx, Value *v, Type *jl_value)
     else {
         return ctx.builder.CreateBitCast(v, jl_value);
     }
+}
+
+static Value *maybe_bitcast(jl_codectx_t &ctx, Value *V, Type *to) {
+    if (to != V->getType())
+        return emit_bitcast(ctx, V, to);
+    return V;
 }
 
 static Value *julia_binding_gv(jl_codectx_t &ctx, Value *bv)
@@ -1270,7 +1276,7 @@ static Value *julia_bool(jl_codectx_t &ctx, Value *cond)
 // --- accessing the representations of built-in data types ---
 
 static Constant *julia_const_to_llvm(jl_value_t *e);
-static Value *data_pointer(jl_codectx_t &ctx, const jl_cgval_t &x, Type *astype = T_ppjlvalue)
+static Value *data_pointer(jl_codectx_t &ctx, const jl_cgval_t &x)
 {
     Value *data = x.V;
     if (x.constant) {
@@ -1282,9 +1288,7 @@ static Value *data_pointer(jl_codectx_t &ctx, const jl_cgval_t &x, Type *astype 
             data = boxed(ctx, x);
         }
     }
-    if (data->getType() != astype)
-        data = emit_bitcast(ctx, data, astype);
-    return decay_derived(data);
+    return data;
 }
 
 static bool emit_getfield_unknownidx(jl_codectx_t &ctx,
@@ -1306,7 +1310,9 @@ static bool emit_getfield_unknownidx(jl_codectx_t &ctx,
             Value *fld = tbaa_decorate(strct.tbaa,
                 maybe_mark_load_dereferenceable(
                     ctx.builder.CreateLoad(
-                        ctx.builder.CreateBitCast(ctx.builder.CreateGEP(decay_derived(data_pointer(ctx, strct)), idx),
+                        ctx.builder.CreateBitCast(
+                            ctx.builder.CreateGEP(decay_derived(
+                            emit_bitcast(ctx, data_pointer(ctx, strct), T_pprjlvalue)), idx),
                             PointerType::get(T_prjlvalue, AddressSpace::Derived))),
                     maybe_null,  minimum_field_size));
             if (maybe_null)
@@ -1379,24 +1385,31 @@ static jl_cgval_t emit_getfield_knownidx(jl_codectx_t &ctx, const jl_cgval_t &st
         bool isboxed;
         Type *lt = julia_type_to_llvm((jl_value_t*)jt, &isboxed);
         if (isboxed) {
-            Value *ptr = decay_derived(data_pointer(ctx, strct, T_pint8));
-            Value *llvm_idx = ConstantInt::get(T_size, jl_field_offset(jt, idx));
-            addr = ctx.builder.CreateGEP(ptr, llvm_idx);
+            addr = decay_derived(data_pointer(ctx, strct));
+            size_t byte_offset = jl_field_offset(jt, idx);
+            // byte_offset == 0 is an important special case here, e.g.
+            // for single field wrapper types. Introducing the bitcast
+            // can pessimize mem2reg
+            if (byte_offset > 0) {
+                addr = ctx.builder.CreateGEP(
+                    emit_bitcast(ctx, addr, T_pint8),
+                    ConstantInt::get(T_size, byte_offset));
+            }
         }
         else {
             if (VectorType *vlt = dyn_cast<VectorType>(lt)) {
                 // doesn't have the struct wrapper, so this must have been a VecElement
                 // cast to the element type so that it can be addressed with GEP
                 lt = vlt->getElementType();
-                Value *ptr = data_pointer(ctx, strct, lt->getPointerTo());
+                Value *ptr = emit_bitcast(ctx, data_pointer(ctx, strct), lt->getPointerTo());
                 Value *llvm_idx = ConstantInt::get(T_size, idx);
                 addr = ctx.builder.CreateGEP(lt, ptr, llvm_idx);
             }
             else if (lt->isSingleValueType()) {
-                addr = data_pointer(ctx, strct, lt->getPointerTo());
+                addr = emit_bitcast(ctx, data_pointer(ctx, strct), lt->getPointerTo());
             }
             else {
-                Value *ptr = data_pointer(ctx, strct, lt->getPointerTo());
+                Value *ptr = emit_bitcast(ctx, data_pointer(ctx, strct), lt->getPointerTo());
                 addr = ctx.builder.CreateStructGEP(lt, ptr, idx);
             }
         }
@@ -1742,7 +1755,7 @@ static void init_bits_cgval(jl_codectx_t &ctx, Value *newv, const jl_cgval_t& v,
 {
     // newv should already be tagged
     if (v.ispointer()) {
-        ctx.builder.CreateMemCpy(newv, data_pointer(ctx, v, T_pint8), jl_datatype_size(v.typ), sizeof(void*));
+        ctx.builder.CreateMemCpy(newv, data_pointer(ctx, v), jl_datatype_size(v.typ), sizeof(void*));
     }
     else {
         init_bits_value(ctx, newv, v.V, tbaa);
@@ -2053,9 +2066,7 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, const jl_cgval_t &src
                 emit_unbox(ctx, store_ty, src, typ, dest, isVolatile);
             }
             else {
-                Value *src_ptr = data_pointer(ctx, src, T_pint8);
-                if (dest->getType() != T_pint8)
-                    dest = emit_bitcast(ctx, dest, T_pint8);
+                Value *src_ptr = data_pointer(ctx, src);
                 if (skip) // copy dest -> dest to simulate an undef value / conditional copy
                     src_ptr = ctx.builder.CreateSelect(skip, dest, src_ptr);
                 unsigned nb = jl_datatype_size(typ);
@@ -2068,9 +2079,8 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, const jl_cgval_t &src
         Value *tindex = ctx.builder.CreateAnd(src.TIndex, ConstantInt::get(T_int8, 0x7f));
         if (skip)
             tindex = ctx.builder.CreateSelect(skip, ConstantInt::get(T_int8, 0), tindex);
-        Value *src_ptr = data_pointer(ctx, src, T_pint8);
-        if (dest->getType() != T_pint8)
-            dest = emit_bitcast(ctx, dest, T_pint8);
+        Value *src_ptr = maybe_bitcast(ctx, data_pointer(ctx, src), T_pint8);
+        dest = maybe_bitcast(ctx, dest, T_pint8);
         BasicBlock *defaultBB = BasicBlock::Create(jl_LLVMContext, "union_move_skip", ctx.f);
         SwitchInst *switchInst = ctx.builder.CreateSwitch(tindex, defaultBB);
         BasicBlock *postBB = BasicBlock::Create(jl_LLVMContext, "post_union_move", ctx.f);
@@ -2107,7 +2117,7 @@ static void emit_unionmove(jl_codectx_t &ctx, Value *dest, const jl_cgval_t &src
         if (skip)
             copy_bytes = ctx.builder.CreateSelect(skip, ConstantInt::get(copy_bytes->getType(), 0), copy_bytes);
         ctx.builder.CreateMemCpy(dest,
-                             data_pointer(ctx, src, T_pint8),
+                             data_pointer(ctx, src),
                              copy_bytes,
                              /*TODO: min-align*/1);
     }
@@ -2193,8 +2203,13 @@ static void emit_setfield(jl_codectx_t &ctx,
 {
     if (sty->mutabl || !checked) {
         assert(strct.ispointer());
-        Value *addr = ctx.builder.CreateGEP(data_pointer(ctx, strct, T_pint8),
-                ConstantInt::get(T_size, jl_field_offset(sty, idx0)));
+        size_t byte_offset = jl_field_offset(sty, idx0);
+        Value *addr = data_pointer(ctx, strct);
+        if (byte_offset > 0) {
+            addr = ctx.builder.CreateGEP(
+                emit_bitcast(ctx, addr, T_pint8),
+                ConstantInt::get(T_size, byte_offset));
+        }
         jl_value_t *jfty = jl_svecref(sty->types, idx0);
         if (jl_field_isptr(sty, idx0)) {
             Value *r = maybe_decay_untracked(boxed(ctx, rhs)); // don't need a temporary gcroot since it'll be rooted by strct
@@ -2221,7 +2236,8 @@ static void emit_setfield(jl_codectx_t &ctx,
         else {
             int align = jl_field_align(sty, idx0);
             typed_store(ctx, addr, ConstantInt::get(T_size, 0), rhs, jfty,
-                strct.tbaa, data_pointer(ctx, strct, T_pjlvalue), align);
+                strct.tbaa, maybe_bitcast(ctx,
+                data_pointer(ctx, strct), T_pjlvalue), align);
         }
     }
     else {

@@ -569,7 +569,7 @@ static Value *julia_to_address(
                     *needStackRestore = true;
                 }
                 ai->setAlignment(16);
-                ctx.builder.CreateMemCpy(ai, data_pointer(ctx, jvinfo, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
+                ctx.builder.CreateMemCpy(ai, data_pointer(ctx, jvinfo), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
                 return ctx.builder.CreatePtrToInt(ai, to);
             }
         }
@@ -588,7 +588,7 @@ static Value *julia_to_address(
         Value *nbytes = emit_datatype_size(ctx, jvt);
         AllocaInst *ai = ctx.builder.CreateAlloca(T_int8, nbytes);
         ai->setAlignment(16);
-        ctx.builder.CreateMemCpy(ai, data_pointer(ctx, jvinfo, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
+        ctx.builder.CreateMemCpy(ai, data_pointer(ctx, jvinfo), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
         Value *p2 = ctx.builder.CreatePtrToInt(ai, to);
         ctx.builder.CreateBr(afterBB);
         ctx.builder.SetInsertPoint(afterBB);
@@ -607,7 +607,7 @@ static Value *julia_to_address(
     }
     else {
         ctx.builder.CreateMemCpy(slot,
-                             data_pointer(ctx, jvinfo, slot->getType()),
+                             data_pointer(ctx, jvinfo),
                              (uint64_t)jl_datatype_size(ety),
                              (uint64_t)jl_datatype_align(ety));
     }
@@ -645,7 +645,7 @@ static Value *julia_to_native(
     }
     else {
         ctx.builder.CreateMemCpy(slot,
-                             data_pointer(ctx, jvinfo, slot->getType()),
+                             data_pointer(ctx, jvinfo),
                              (uint64_t)jl_datatype_size(jlto),
                              (uint64_t)jl_datatype_align(jlto));
     }
